@@ -27,12 +27,14 @@
 
 module AP_MODULE_DECLARE_DATA reproxy_module;
 
-#define REPROXY_VERSION 0.01
-#define REPROXY_VERSION_STR "0.01"
+#define REPROXY_VERSION 0.011
+#define REPROXY_VERSION_STR "0.01.1"
 
 #define REPROXY_FLAG_UNSET -1
 #define REPROXY_FLAG_OFF 0
 #define REPROXY_FLAG_ON 1
+
+#define CONTENT_RANGE_HEADER  "Content-Range"
 
 typedef struct {
   int enabled;
@@ -92,19 +94,20 @@ static size_t reproxy_curl_header_cb(const void* ptr, size_t size, size_t nmemb,
     int minor_ver, status;
     if (sscanf(ptr, "HTTP/1.%d %d ", &minor_ver, &status) == 2 && status != 200)
       info->filt->r->status = status;
-  } else if (strncasecmp(ptr, "content-type:", sizeof("content-type:") - 1)
-	     == 0) {
+  } else if (strncasecmp(ptr, "content-type:", sizeof("content-type:") - 1) == 0) {
     request_rec* r = info->filt->r;
     const char* s = (const char*)ptr + sizeof("content-type:") - 1,
       * e = (const char*)ptr + size * nmemb - 1;
-    for (; s <= e; --e)
-      if (*e != '\r' && *e != '\n')
-	break;
-    for (; s <= e; ++s)
-      if (*s != ' ' && *s != '\t')
-	break;
-    if (s <= e)
-      ap_set_content_type(r, apr_pstrndup(r->pool, s, e - s + 1));
+    for (; s <= e; --e) if (*e != '\r' && *e != '\n') break;
+    for (; s <= e; ++s) if (*s != ' ' && *s != '\t') break;
+    if (s <= e) ap_set_content_type(r, apr_pstrndup(r->pool, s, e - s + 1));
+  } else if (strncasecmp(ptr, CONTENT_RANGE_HEADER ":", sizeof(CONTENT_RANGE_HEADER)) == 0) {
+    request_rec* r = info->filt->r;
+    const char* s = (const char*)ptr + sizeof(CONTENT_RANGE_HEADER),
+      * e = (const char*)ptr + size * nmemb - 1;
+    for (; s <= e; --e) if (*e != '\r' && *e != '\n') break;
+    for (; s <= e; ++s) if (*s != ' ' && *s != '\t') break;
+    if (s <= e) apr_table_set(r->headers_out, CONTENT_RANGE_HEADER, apr_pstrndup(r->pool, s, e - s + 1));
   }
   
   return nmemb;
@@ -135,7 +138,7 @@ static apr_status_t reproxy_output_filter(ap_filter_t* f,
 					  apr_bucket_brigade* in_bb)
 {
   request_rec* r =f->r;
-  const char* reproxy_url;
+  const char* reproxy_url, *range;
   
   /* pass thru by request types */
   if (r->status != HTTP_OK || r->main != NULL || r->header_only
@@ -146,12 +149,12 @@ static apr_status_t reproxy_output_filter(ap_filter_t* f,
   if ((reproxy_url = apr_table_get(r->headers_out, "x-reproxy-url")) != NULL)
     apr_table_unset(r->headers_out, "x-reproxy-url");
   if (reproxy_url == NULL || *reproxy_url == '\0')
-    if ((reproxy_url = apr_table_get(r->err_headers_out, "x-reproxy-url"))
-	!= NULL)
+    if ((reproxy_url = apr_table_get(r->err_headers_out, "x-reproxy-url")) != NULL)
       apr_table_unset(r->err_headers_out, "x-reproxy-url");
   if (reproxy_url == NULL || *reproxy_url == '\0')
     goto PASS_THRU;
-  
+  range = apr_table_get(r->headers_out, CONTENT_RANGE_HEADER);
+
   /* drop all content and headers related */
   while (! APR_BRIGADE_EMPTY(in_bb)) {
     apr_bucket* b = APR_BRIGADE_FIRST(in_bb);
@@ -169,12 +172,51 @@ static apr_status_t reproxy_output_filter(ap_filter_t* f,
     CURLcode ret;
     reproxy_curl_cb_info info;
     int threaded_mpm;
+    char header_buf[(20+2)*2+20+sizeof(CONTENT_RANGE_HEADER)];
+    struct curl_slist range_header = { header_buf, NULL };
+    apr_off_t range_start = 0, range_end = 0;
     assert(curl != NULL);
     info.filt = f;
     info.bb = in_bb;
     ap_mpm_query(AP_MPMQ_IS_THREADED, &threaded_mpm);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, threaded_mpm);
     curl_easy_setopt(curl, CURLOPT_URL, reproxy_url);
+
+    if(range) {
+      char *p, *d, *next, buf[strlen(range)+1];
+      strcpy(buf, range);
+      // get range start
+      p = apr_strtok(buf, " -/", &next);
+      if(p && apr_strnatcasecmp(p, "bytes")==0) {
+        // skip 'bytes' token
+        p = apr_strtok(next, " -/", &next);
+      } else {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,
+            "Missing 'bytes' token: " CONTENT_RANGE_HEADER ": %s, ignored.", range);
+      }
+      if(p) {
+        apr_strtoff(&range_start, p, &d, 10);
+        if(*d!='\0') goto INVALID_ARGUMENT;
+      }
+      // get range end
+      p = apr_strtok(next, " -,/", &next);
+      if(p) {
+        apr_strtoff(&range_end, p, &d, 10);
+        if(*d!='\0') goto INVALID_ARGUMENT;
+      }
+      // check
+      if(range_start>=range_end) {
+    INVALID_ARGUMENT:
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server,
+            "Invalid " CONTENT_RANGE_HEADER ": %s (%ld-%ld).", range, range_start, range_end);
+        range = NULL;
+      }
+    }
+    if(range) {
+      unset_header(r, CONTENT_RANGE_HEADER);
+      snprintf(header_buf, sizeof(header_buf), "Range: bytes=%ld-%ld", range_start, range_end);
+      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, &range_header);
+    }
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
     curl_easy_setopt(curl, CURLOPT_WRITEHEADER, &info);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, reproxy_curl_header_cb);
