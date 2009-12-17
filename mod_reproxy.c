@@ -205,7 +205,7 @@ static apr_status_t reproxy_output_filter(ap_filter_t* f,
         if(*d!='\0') goto INVALID_ARGUMENT;
       }
       // check
-      if(range_start>=range_end) {
+      if(range_start>range_end) {
     INVALID_ARGUMENT:
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server,
             "Invalid " CONTENT_RANGE_HEADER ": %s (%ld-%ld).", range, range_start, range_end);
